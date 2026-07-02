@@ -18,15 +18,18 @@
 /* USER CODE END Header */
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
+#include "i2c.h"
 #include "tim.h"
 #include "usb_device.h"
 #include "gpio.h"
 
 /* Private includes ----------------------------------------------------------*/
+
+
 /* USER CODE BEGIN Includes */
-#include "usbd_cdc_if.h"
 #include <stdio.h>
 #include <string.h>
+#include "usbd_cdc_if.h" // Required for USB-C serial transmission
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -36,12 +39,6 @@
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
-#define MOTOR_PWM_MAX_DUTY       (__HAL_TIM_GET_AUTORELOAD(&htim2) + 1U)
-#define PID_SAMPLE_TIME_MS       50U
-#define PID_SAMPLE_TIME_SEC      0.05f
-#define ENCODER_TICKS_PER_REV    7392.0f
-#define PI                       3.14159265f
-#define WHEEL_RADIUS_M           0.033f
 
 /* USER CODE END PD */
 
@@ -53,26 +50,18 @@
 /* Private variables ---------------------------------------------------------*/
 
 /* USER CODE BEGIN PV */
-volatile int16_t encoder_ticks = 0;
-int16_t prev_ticks = 0;
+uint8_t mpu6050_address = 0;
+uint8_t mpu6050_ready = 0;
 
-/* PID Variables */
-volatile float target_rpm = 0.0f; // Updated by USB CDC command input.
-volatile float target_velocity_mps = 0.0f;
-extern volatile uint8_t target_rpm_updated;
-float current_rpm = 0.0f;
-float error = 0.0f;
-float previous_error = 0.0f;
-float integral = 0.0f;
+// IMU Raw Data
+int16_t raw_acc_x = 0, raw_acc_y = 0, raw_acc_z = 0;
+int16_t raw_gyro_x = 0, raw_gyro_y = 0, raw_gyro_z = 0;
 
-/* Tuning Gains (Start with P and I only) */
-float Kp = 10.0f; // The Muscle
-float Ki = 0.5f;  // The Memory
-float Kd = 0.0f;  // The Brakes
+// Calibration Offsets
+int32_t gyro_x_offset = 0, gyro_y_offset = 0, gyro_z_offset = 0;
 
-float control_output = 0.0f; // The calculated adjustment
-float current_pwm = 0.0f;    // The actual PWM applied to the motor
-char usb_msg[96];
+// USB Buffer
+char usb_tx_buffer[192];
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -83,27 +72,7 @@ void SystemClock_Config(void);
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
-static void Motor_Forward(uint32_t speed)
-{
-  if (speed > MOTOR_PWM_MAX_DUTY)
-  {
-    speed = MOTOR_PWM_MAX_DUTY;
-  }
 
-  __HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_2, 0);     // LPWM (Reverse OFF)
-  __HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_1, speed); // RPWM (Forward)
-}
-
-static void Motor_Reverse(uint32_t speed)
-{
-  if (speed > MOTOR_PWM_MAX_DUTY)
-  {
-    speed = MOTOR_PWM_MAX_DUTY;
-  }
-
-  __HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_1, 0);     // RPWM (Forward OFF)
-  __HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_2, speed); // LPWM (Reverse)
-}
 /* USER CODE END 0 */
 
 /**
@@ -138,87 +107,113 @@ int main(void)
   MX_TIM2_Init();
   MX_TIM3_Init();
   MX_USB_Device_Init();
-  /* USER CODE BEGIN 2 */
-  HAL_TIM_PWM_Start(&htim2, TIM_CHANNEL_1);
-  HAL_TIM_PWM_Start(&htim2, TIM_CHANNEL_2);
-  __HAL_TIM_SET_COUNTER(&htim3, 0);
-  HAL_TIM_Encoder_Start(&htim3, TIM_CHANNEL_ALL);
-  Motor_Forward(0);
+  MX_I2C1_Init();
+/* USER CODE BEGIN 2 */
+  HAL_Delay(800); 
+  
+  // 1. Scan for MPU6050
+  for (uint8_t i = 1; i < 128; i++)
+  {
+      if (HAL_I2C_IsDeviceReady(&hi2c1, (uint16_t)(i << 1), 2, 10) == HAL_OK)
+      {
+          if ((i == 0x68) || (i == 0x69))
+          {
+              mpu6050_address = i;
+              break;
+          }
+      }
+  }
 
-  /* USER CODE END 2 */
+  // 2. Wake Up Sensor
+  if (mpu6050_address != 0)
+  {
+      uint8_t wake_data = 0x00;
+      if (HAL_I2C_Mem_Write(&hi2c1, (uint16_t)(mpu6050_address << 1), 0x6B, 1, &wake_data, 1, 10) == HAL_OK)
+      {
+          mpu6050_ready = 1;
+      }
+  }
+
+  // 3. Calibrate Gyroscopes (Keep it still for 1 second!)
+  if (mpu6050_ready == 1)
+  {
+      int32_t sum_gx = 0, sum_gy = 0, sum_gz = 0;
+      uint8_t calib_buf[6]; 
+
+      for (uint16_t i = 0; i < 500; i++)
+      {
+          if (HAL_I2C_Mem_Read(&hi2c1, (uint16_t)(mpu6050_address << 1), 0x43, 1, calib_buf, 6, 10) == HAL_OK)
+          {
+              sum_gx += (int16_t)((calib_buf[0] << 8) | calib_buf[1]);
+              sum_gy += (int16_t)((calib_buf[2] << 8) | calib_buf[3]);
+              sum_gz += (int16_t)((calib_buf[4] << 8) | calib_buf[5]);
+          }
+          HAL_Delay(2); 
+      }
+      
+      gyro_x_offset = sum_gx / 500;
+      gyro_y_offset = sum_gy / 500;
+      gyro_z_offset = sum_gz / 500;
+  }
+/* USER CODE END 2 */
 
   /* Infinite loop */
+/* Infinite loop */
+/* Infinite loop */
   /* USER CODE BEGIN WHILE */
-
   while (1)
   {
-    /* 1. Read Current Ticks */
-    encoder_ticks = (int16_t)__HAL_TIM_GET_COUNTER(&htim3);
+      uint8_t i2c_buf[14]; 
+      uint8_t read_ok = 0;
+      
+      // Read all 6 axes
+      if ((mpu6050_ready != 0) && (HAL_I2C_Mem_Read(&hi2c1, (uint16_t)(mpu6050_address << 1), 0x3B, 1, i2c_buf, 14, 10) == HAL_OK))
+      {
+          read_ok = 1;
+          raw_acc_x = (int16_t)((i2c_buf[0] << 8) | i2c_buf[1]);
+          raw_acc_y = (int16_t)((i2c_buf[2] << 8) | i2c_buf[3]);
+          raw_acc_z = (int16_t)((i2c_buf[4] << 8) | i2c_buf[5]);
+          
+          raw_gyro_x = (int16_t)((i2c_buf[8] << 8)  | i2c_buf[9]);
+          raw_gyro_y = (int16_t)((i2c_buf[10] << 8) | i2c_buf[11]);
+          raw_gyro_z = (int16_t)((i2c_buf[12] << 8) | i2c_buf[13]);
+      }
 
-    /* 2. Calculate the difference (This naturally handles the 16-bit rollover!) */
-    int16_t tick_diff = encoder_ticks - prev_ticks;
-    prev_ticks = encoder_ticks;
+      int msg_len;
 
-    /* Make forward rotation positive based on the current encoder wiring. */
-    tick_diff = -tick_diff;
+      if (read_ok != 0)
+      {
+          // Scaled integer output avoids needing float printf support.
+          int32_t gx_mdps = ((int32_t)raw_gyro_x - gyro_x_offset) * 1000L / 131L;
+          int32_t gy_mdps = ((int32_t)raw_gyro_y - gyro_y_offset) * 1000L / 131L;
+          int32_t gz_mdps = ((int32_t)raw_gyro_z - gyro_z_offset) * 1000L / 131L;
 
-    /* 3. Convert tick difference to RPM (50ms loop) */
-    current_rpm = ((float)tick_diff * 60.0f) / (ENCODER_TICKS_PER_REV * PID_SAMPLE_TIME_SEC);
+          int32_t ax_mmps2 = (int32_t)raw_acc_x * 9810L / 16384L;
+          int32_t ay_mmps2 = (int32_t)raw_acc_y * 9810L / 16384L;
+          int32_t az_mmps2 = (int32_t)raw_acc_z * 9810L / 16384L;
 
-    /* 4. The PID Math */
-    if (target_rpm_updated != 0U)
-    {
-      integral = 0.0f;
-      previous_error = 0.0f;
-      target_rpm_updated = 0U;
-    }
+          msg_len = snprintf(usb_tx_buffer, sizeof(usb_tx_buffer),
+                             "Gyro_mdps [X:%ld Y:%ld Z:%ld] Accel_mmps2 [X:%ld Y:%ld Z:%ld] RawAcc [X:%d Y:%d Z:%d]\r\n",
+                             (long)gx_mdps, (long)gy_mdps, (long)gz_mdps,
+                             (long)ax_mmps2, (long)ay_mmps2, (long)az_mmps2,
+                             raw_acc_x, raw_acc_y, raw_acc_z);
+      }
+      else
+      {
+          msg_len = snprintf(usb_tx_buffer, sizeof(usb_tx_buffer),
+                             "MPU6050 not ready/read failed. addr=0x%02X ready=%u\r\n",
+                             mpu6050_address, mpu6050_ready);
+      }
 
-    error = target_rpm - current_rpm;
-    integral += error * PID_SAMPLE_TIME_SEC;
-    
-    // Anti-Windup: Prevent the memory from getting ridiculously large
-    if (integral > 100.0f) integral = 100.0f;
-    if (integral < -100.0f) integral = -100.0f;
+      if (msg_len > 0)
+      {
+          CDC_Transmit_FS((uint8_t*)usb_tx_buffer, (uint16_t)msg_len);
+      }
 
-    float derivative = (error - previous_error) / PID_SAMPLE_TIME_SEC;
-    previous_error = error;
+      HAL_Delay(500);
+    /* USER CODE END WHILE */
 
-    // Calculate the total adjustment needed
-    control_output = (Kp * error) + (Ki * integral) + (Kd * derivative);
-
-    /* 5. Apply the adjustment to the Motor PWM */
-    current_pwm += control_output;
-
-    // Safety Clamp: allow full reverse to full forward
-    if (current_pwm > (float)MOTOR_PWM_MAX_DUTY) current_pwm = (float)MOTOR_PWM_MAX_DUTY;
-    if (current_pwm < -(float)MOTOR_PWM_MAX_DUTY) current_pwm = -(float)MOTOR_PWM_MAX_DUTY;
-
-    if (current_pwm >= 0.0f)
-    {
-      Motor_Forward((uint32_t)current_pwm);
-    }
-    else
-    {
-      Motor_Reverse((uint32_t)(-current_pwm));
-    }
-
-    /* 6. Telemetry: Send data to USB */
-    int msg_len = snprintf(usb_msg, sizeof(usb_msg), "Target: %d rpm | Cmd: %d mm/s | RPM: %d | PWM: %d\r\n",
-                           (int)target_rpm, (int)(target_velocity_mps * 1000.0f),
-                           (int)current_rpm, (int)current_pwm);
-    if (msg_len > 0)
-    {
-      CDC_Transmit_FS((uint8_t*)usb_msg, (uint16_t)msg_len);
-    }
-
-    /* Toggle the onboard LED */
-    HAL_GPIO_TogglePin(DEBUG_LED_GPIO_Port, DEBUG_LED_Pin);
-    
-    /* 7. Timing Control: 50ms (20Hz Update Rate) */
-    HAL_Delay(PID_SAMPLE_TIME_MS);
-  /* USER CODE END WHILE */
-
-  /* USER CODE BEGIN 3 */
+    /* USER CODE BEGIN 3 */
   }
   /* USER CODE END 3 */
 }

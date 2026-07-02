@@ -277,7 +277,7 @@ static int8_t CDC_Receive_FS(uint8_t* Buf, uint32_t *Len)
 
     if ((received == '\r') || (received == '\n'))
     {
-      CDC_ParseCommand();
+      //CDC_ParseCommand();
     }
     else if ((received >= ' ') && (received <= '~'))
     {
@@ -293,7 +293,7 @@ static int8_t CDC_Receive_FS(uint8_t* Buf, uint32_t *Len)
     }
   }
 
-  CDC_ParseCommand();
+  //CDC_ParseCommand();
 
   USBD_CDC_SetRxBuffer(&hUsbDeviceFS, &Buf[0]);
   USBD_CDC_ReceivePacket(&hUsbDeviceFS);
